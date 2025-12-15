@@ -1,0 +1,2187 @@
+---
+title: "Sponsor Data Preparation"
+author: "Josh Gilberstadt"
+date: "`r Sys.Date()`"
+
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0(substr(inputFile,1,nchar(inputFile)-4), "-",Sys.Date(),'.html')) })
+
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+
+now <<- Sys.time()
+
+library(rmarkdown)
+library(ggplot2)
+library(pROC)
+library(data.table)
+library(caret)
+library(plyr)
+library(dplyr)
+library(ggpubr)
+library(expss)
+library(ggforce)
+library(gridExtra)
+# visualizing the effects of variables in a GLM
+library(effects)
+library(Matrix)
+
+# For nicer looking html tables
+library(formattable)
+library(readxl)
+
+# For summary tables
+library(qwraps2)
+options(qwraps2_markup = "markdown")
+
+library(DiagrammeR)
+#http://rich-iannone.github.io/DiagrammeR/graphviz_and_mermaid.html
+#https://bookdown.org/yihui/rmarkdown-cookbook/diagrams.html
+
+
+# Parallel processing
+# https://bookdown.org/rdpeng/rprogdatascience/parallel-computation.html
+library(foreach)
+
+
+library(doParallel)
+
+if (Sys.info()["sysname"] == "Darwin") {
+  # Mac
+} else {
+  # PC/Windows
+  library(doSNOW)
+}
+
+
+
+# Plot & visualization
+theme_new <- function(base_size = 12, base_family = ""){
+  theme_bw(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      legend.key=element_rect(colour=NA, fill =NA),
+      panel.grid = element_blank(),   
+      panel.border = element_rect(fill = NA, colour = "black", size=1),
+      panel.background = element_rect(fill = "white", colour = "black"), 
+      strip.background = element_rect(fill = NA)
+    )
+}
+
+theme_set(theme_new(base_size = 16))
+
+
+printpct_tw = function(percentage) {
+  percentage = as.numeric(percentage)
+  
+  if (is.na(percentage) | percentage == 0)
+    return("-")
+  else
+    return(paste0(percentage, "%"))
+}
+
+categorize_aps = function (APS) {
+  
+  if (is.na(APS)) {
+    return(NA)
+  }
+  
+  if (APS <= "*redacted*") {
+    return("Low")
+  } else if (APS >= "*redacted*") {
+    return("High")
+  } else {
+    return("Intermediate")
+  }
+  
+}
+
+
+count_e4_alleles = function (Proteotype) {
+  
+  if(is.na(Proteotype))
+    return(NA)
+  
+  if (Proteotype == "E2/E4" || Proteotype == "E3/E4"){
+    return(1)
+  } else if (Proteotype == "E2/E2" || Proteotype == "E2/E3" || Proteotype == "E3/E3"){
+    return(0)
+  } else if (Proteotype == "E4/E4"){
+    return(2)
+  } else {
+    return(NA)
+  }
+}
+
+is_e2_present = function (Proteotype) {
+  
+  if(is.na(Proteotype))
+    return(NA)
+
+  if (Proteotype == "E2/E4" || Proteotype == "E2/E2" || Proteotype == "E2/E3"){
+    return(T)
+  } else if (Proteotype == "E3/E3" || Proteotype == "E3/E4" || Proteotype == "E4/E4"){
+    return(F)
+  } else {
+    return(NA)
+  }
+}
+
+
+
+categorize_Proteotype = function (Proteotype) {
+
+  if(is.na(Proteotype))
+    return(NA)
+
+  
+  if (Proteotype == "E2/E4" || Proteotype == "E3/E4" || Proteotype == "E4/E4"){
+    return("POS")
+  } else if (Proteotype == "E2/E2" || Proteotype == "E2/E3" || Proteotype == "E3/E3"){
+    return("NEG")
+  } else {
+    return(NA)
+  }
+}
+
+
+## date given as number of days since 1900-01-01 (a date in 1989)
+##  as.Date(32768, origin = "1900-01-01")
+## Excel is said to use 1900-01-01 as day 1 (Windows default) or
+## 1904-01-01 as day 0 (Mac default), but this is complicated by Excel
+## incorrectly treating 1900 as a leap year.
+## So for dates (post-1901) from Windows Excel:
+##  as.Date(35981, origin = "1899-12-30") # 1998-07-05
+
+
+getDateFromExcel = function (datestring) {
+  
+  converteddate = NA
+  
+  if(is.na(as.numeric(datestring))) {
+    # the date is a string not a number
+    converteddate = as.Date(datestring, tryFormats = c("%d%b%Y"))
+    
+  } else {
+    # the date is stored as Excel date - which is converted to a number when cast as text
+    converteddate = as.Date(as.numeric(datestring), origin = "1899-12-30")
+    
+  }
+  
+  return(as.character(converteddate))
+  
+}
+
+currentDate = format(Sys.Date(), "%Y%m%d") 
+
+```
+
+# Background
+
+March 2023. We used to just get Abeta and ApoE data for this study and we would merge it into a wide dataframe along with age, subject ID from the sponsor. But we will now also get p-tau217 data, and there has been a change in priorities where ApoE data is now high priority for reporting - so the script has to be updated in order to be able to gather the data from the various sources and merge it into a single, final file for sharing...
+
+```{r}
+#How to check differences on Mac:
+#diff --strip-trailing-cr Study_PROD_FULL_202304041.csv Study_PROD_FULL_202304041\ copy.csv
+```
+
+
+
+* Version 2.3: Update to DTA version 1.3
+
+They want us to report NP_TAU217 and P_TAU217_RATIO as "NPTAU217" and "PTAU_RTO", respectively since these test codes were too long - they want as 8 characters or less. But they are fine with APOE_POSNEG staying as is.
+
+
+
+## Data Processing
+
+Cumulative data input files:
+
+-   "All Abeta Data_DDMMMYYYY.xlsx"
+
+    -   This file has Abeta42 and 40 data per *Plasma Barcodes* along with *Batch#* and *Run date*
+
+    -   This file has a *Comments* field. If this field has a value - it means that the sample was not run and the value in this field should be used for "Reason not done"
+
+    -   For direct from site samples, this file also has *Date of collection*, *Year of birth*, *SubjectID*
+
+    -   For samples that have come from the biobank, the *Date of collection* and *Year of birth* fields are empty, *SubjectID* may be present for some patients but not all
+
+-   "All ApoE Data_DDMMMYYYY.xlsx"
+
+    -   This file contains: *Plasma Barcodes*, *Proteotype*, *Comments*
+
+    -   There are no *Date of collection*, *Year of birth*, *SubjectID* in this file - these values have to come from the Abeta data file
+
+-   "All Tau Data_DDMMMYYYY.xlsx"
+
+    -   This file follows the same format as the Abeta data file.
+
+    -   This file has p-tau217 and np-tau217 data per *Plasma Barcodes* along with *Batch#* and *Run date*
+
+    -   This file has a *Comments* field. If this field has a value - it means that the sample was not run and the value in this field should be used for "Reason not done"
+
+    -   For direct from site samples, this file also has, *Date of collection*, *Year of birth*, *SubjectID*
+
+    -   For samples that have come from the biobank, the *Date of collection* and *Year of birth* fields are empty, *SubjectID* may be present for some patients but not all
+
+-   "Study Participant Age Listing.csv" from portal
+
+    -   For samples that come from the biobank - we download a file from their server which has the *Plasma Barcodes*, *Date of collection*, *SubjectID*, and age of the patient
+
+    -   Downloaded file is saved to agedata/ folder for future reference
+
+Merge process:
+
+-   Abeta and ApoE files are merged and must have 1:1 correspondence in terms of *Plasma Barcodes* since the ApoE data relies on the Abeta file for obtaining *Date of collection*, *Year of birth*, *SubjectID*
+
+-   A wide dataframe is generated where Abeta, ApoE, tau, age data is in separate columns per each *Plasma Barcodes*
+
+    -   *Date of collection* and *SubjectID* are filtered in from various sources
+
+    -   Age is taken from sponsor file or calculated based on *Date of collection* and *Year of birth*
+
+-   Once SubjectIDs are merged in - it is possible to check for duplicates in the data set
+
+    -   Sometimes multiple samples may come from one subject - in these instances we should report on only the first sample where we have data, except where there is a direct from site sample in addition to a biobanked sample - for those always pick the direct from site sample if that sample has good data. This is how the original script was setup and done to always get data from the best sample (biobanked samples have longer shipping and handling as they are over labeled by the biobank).
+
+    -   Once we have data for a sample we report that data, if another sample is analyzed for that participant - we do not want to overwrite data that has already been reported - so we will discard data from newer samples analyzed, even if that data is good data.
+
+    -   We will now need to do this check on a per analyte basis.
+
+    -   **For Abeta, ApoE, and p-tau217 we check to get earliest good data.**
+
+### Limits of Quantitation
+
+> April 7 2023 email:
+
+p-tau217: 0.5 – 81 pg/mL
+np-tau217: 7 – 376 pg/mL
+
+```{r echo=TRUE}
+LLOQ_pTau217_v1  = 0.5
+LLOQ_npTau217_v1 = 7
+ULOQ_pTau217_v1  = 81
+ULOQ_npTau217_v1 = 376
+```
+
+
+## Data Flow
+
+```{r}
+grViz("digraph flowchart {
+  # node definitions with substituted label text
+  node [fontname = Helvetica, shape = rectangle, fixedsize = false, width = 1] 
+  1 [label = 'Abeta Data']
+  1p2 [label = 'ApoE Data']
+  1p3 [label = 'Tau Data']
+  1p4 [label = 'Age Data']
+  2 [label = 'Merge data by barcode\n(wide format)']
+  3 [label = 'Assemble data by SubjectID\n(long format)', shape = oval]
+  4 [label = 'Calculate APS and APS2']
+  41 [label = 'Perform checks on the data\nSimple QC checks\nCheck against previous file']
+  5 [label = 'Generate output files']
+  6 [label = 'Study_PROD_FULL...\nFull biormarker csv file']
+  7 [label = 'prod...\nOracle IRT csv file']
+  61 [label = 'Upload to webserver']
+  71 [label = 'Upload to Oracle by sFTP']
+
+  node [shape=none, width=0, height=0, label='']
+  1 -> 2 -> 3 -> 4 -> 41 -> 5 -> 6; 5 -> 7; 1p2 -> 2; 1p3 -> 2; 1p4 -> 2; 6 -> 61; 7 -> 71; 
+  # Just a little fun to show this is run in parallel
+  3 -> 3; 3 -> 3; 3 -> 3; 3 -> 3;
+
+}")
+```
+
+# Versions
+
+## Version 2p5
+
+Implement reporting for data obtained from version two of the p-tau217 assay.
+
+New limits of quantitation:
+
+```{r echo=TRUE}
+LLOQ_pTau217_v2  = 1.3
+LLOQ_npTau217_v2 = 6.6
+ULOQ_pTau217_v2  = 51
+ULOQ_npTau217_v2 = 412
+```
+
+Conversion from old ratio to V2 ratio:
+
+```{r echo=TRUE}
+Intercept = -0.8246919
+Slope     =  3.0787610
+
+#p_tau217_ratio_v2 = Slope * p_tau217_ratio_v1 + Intercept
+#p_tau217_ratio_v1 = (p_tau217_ratio_v2 - Intercept)/Slope)
+
+```
+
+## Version 2p6
+
+New limits of quantitation was not implemented in the last version! This version will apply V1/V2 LOQs based on what assay was used.
+
+
+
+## Version 2p7
+
+For samples where we have no p-tau217 data we need to report as status = ND and reason not done as "no sample received for this analysis".
+
+## Version 2p8
+
+For samples where the np-tau217 is BLQ and p-tau217 is BLQ - it will calculate the ratio. After careful review of how the ratio is calculated - the method needs to be updated so a ratio is calculated after the BLQ/ALQ checks.
+
+## Version 2p9
+
+The aliquots for rescreen samples must be processed with "_2" at the end to avoid duplication, but the rescreen aliquots in the output file are still the same as the original aliquots.
+
+
+
+# Load and merge data
+
+## Read Abeta and ApoE files from lab
+
+```{r}
+
+folder = "cumulativefiles"
+
+```
+
+This script no-longer needs to know what the latest file is - it will find the latest files in the folder "*`r folder`*" automatically.
+
+### Abeta
+
+Get the latest Abeta file
+
+```{r}
+
+files = file.info(list.files(folder, pattern = "All Abeta Data", full.names = T))
+latesfile.abeta = rownames(files[which.max(files$mtime),])
+
+message(paste0("Latest file for Abeta is: ", latesfile.abeta))
+
+```
+
+```{r}
+
+
+# Read Abeta file and force column types
+#  Cast Abeta40 and 42 as numbers to force NA introduction where lab puts "N/A"
+abetadata = read_xlsx(latesfile.abeta, 
+                      col_types = c("text", "numeric", "numeric", "text", "text", "text", "numeric", "text", "numeric", "date"))
+
+abetadata$converteddate = sapply(abetadata$`Date of collection`, getDateFromExcel)
+abetadata$converteddate = as.Date(abetadata$converteddate)
+
+colnames(abetadata) = c("LBREFID", "Abeta40_Plasma_IPMS", "Abeta42_Plasma_IPMS", "Abeta4240_Plasma_IPMS_excel", "Abeta_comment", "LBDTC_excel", "YOB", "USUBJID_s", "Abeta_batch", "Abeta_rundate", "LBDTC")
+
+
+abetadata = abetadata[,!(names(abetadata) %in% c("Abeta4240_Plasma_IPMS_excel"))]
+
+# Then convert to numbers and round to 3 decimals
+abetadata$Abeta40_Plasma_IPMS = round(as.numeric(abetadata$Abeta40_Plasma_IPMS), 3)
+abetadata$Abeta42_Plasma_IPMS = round(as.numeric(abetadata$Abeta42_Plasma_IPMS), 3)
+
+# Calculate the ratio
+abetadata$Abeta4240_Plasma_IPMS = abetadata$Abeta42_Plasma_IPMS / abetadata$Abeta40_Plasma_IPMS
+
+
+```
+
+#### Date conversions for the most recent batch:
+
+```{r}
+paged_table(abetadata[which(abetadata$Abeta_batch == max(abetadata$Abeta_batch)), c("LBREFID", "LBDTC_excel", "LBDTC")])
+```
+
+#### Samples in cumulative file that has USUBJID_s but does not have LBDTC_excel
+
+```{r}
+
+paged_table(abetadata[which(!is.na(abetadata$USUBJID_s) & is.na(abetadata$LBDTC_excel)), c("LBREFID", "LBDTC_excel", "USUBJID_s")])
+
+
+```
+
+#### Data points per batch
+
+```{r}
+
+plot(table(abetadata$Abeta_batch))
+
+```
+
+#### Clean the comments
+
+Keep only comments regarding sample volume - re-injected samples can be part of final analysis.
+
+```{r}
+
+# Convert "" to NA
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "")] = NA
+
+
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "reinject due to poor peak shape")] = NA
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "reinjected due to poor peak shape")] = NA
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "Reinjected due to poor peak shape")] = NA
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "Contaminant present; mag bead clumping; Ion ratio failure on 1st injection; resolved on 2nd injection.")] = NA
+
+# clean up QNS
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "250 uL plasma")] = "QNS"
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "300 uL plasma")] = "QNS"
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "350 uL plasma")] = "QNS"
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "375 uL plasma")] = "QNS"
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "400 uL plasma")] = "QNS"
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "400 uL plasma; reinject due to poor peak shape")] = "QNS"
+abetadata$Abeta_comment[which(abetadata$Abeta_comment == "400 uL plasma; Reinjected due to poor peak shape")] = "QNS"
+
+
+paste0("Number of samples with comments: ", sum(as.numeric(!is.na(abetadata$Abeta_comment))))
+
+```
+
+Change "\u03b2" to "beta"
+
+```{r}
+
+abetadata$Abeta_comment = gsub('\u03b2', 'beta', abetadata$Abeta_comment)
+
+formattable(table(abetadata$Abeta_comment))
+
+```
+
+If there are comments - we need to remove the data! Mostly, this needs to be done since some of the original analyzed samples had comments like "250 uL plasma" - which has now been changed to "QNS" and we should not be reporting data on these samples.
+
+```{r}
+
+#abetadata[which(!is.na(abetadata$Abeta_comment)), c("LBREFID", "Abeta42_Plasma_IPMS", "Abeta40_Plasma_IPMS", "Abeta4240_Plasma_IPMS", "Abeta_comment")]
+
+abetadata[which(!is.na(abetadata$Abeta_comment)), "Abeta42_Plasma_IPMS"] = NA
+abetadata[which(!is.na(abetadata$Abeta_comment)), "Abeta40_Plasma_IPMS"] = NA
+abetadata[which(!is.na(abetadata$Abeta_comment)), "Abeta4240_Plasma_IPMS"] = NA
+
+#abetadata[which(!is.na(abetadata$Abeta_comment)), c("LBREFID", "Abeta42_Plasma_IPMS", "Abeta40_Plasma_IPMS", "Abeta4240_Plasma_IPMS", "Abeta_comment")]
+
+```
+
+### ApoE
+
+```{r}
+files = file.info(list.files(folder, pattern = "All ApoE Data", full.names = T))
+latesfile.apoe = rownames(files[which.max(files$mtime),])
+
+message(paste0("Latest file for ApoE is: ", latesfile.apoe))
+
+```
+
+```{r}
+# Read ApoE file and force column types
+apoedata  = read_excel(latesfile.apoe,
+                       col_types = c("text", "text", "text"))
+
+# Rename columns per DTA
+
+colnames(apoedata) = c("LBREFID", "Proteotype", "ApoE_comment")
+
+```
+
+Proteotypes in the file:
+
+```{r}
+table(apoedata$Proteotype)
+```
+
+Looks like some comments may have made it into the proteotype field...
+
+```{r}
+apoedata[which(apoedata$Proteotype == "QNS"), ]
+```
+
+Remove all non-valid genotypes (particularly "N/A").
+
+```{r}
+
+validgenotypes = c("E2/E2", "E2/E3", "E2/E4", "E3/E3", "E3/E4", "E4/E4", "Unknown")
+
+apoedata[!(apoedata$Proteotype %in% validgenotypes), "Proteotype"] = NA
+
+table(apoedata$Proteotype)
+
+```
+
+#### Generate the APOE_POSNEG
+
+```{r}
+# Generate APOE_POSNEG Column
+apoedata$APOE_POSNEG = sapply(apoedata$Proteotype, categorize_Proteotype)
+
+table(apoedata$APOE_POSNEG)
+
+```
+
+#### Clean the comments
+
+```{r}
+formattable(table(apoedata$ApoE_comment))
+```
+
+```{r}
+
+# Convert "" to NA
+apoedata$ApoE_comment[which(apoedata$ApoE_comment == "")] = NA
+
+formattable(table(apoedata$ApoE_comment))
+
+```
+
+Remove data for samples with comments
+
+```{r}
+
+#apoedata[which(!is.na(apoedata$ApoE_comment)), c("LBREFID", "Proteotype", "ApoE_comment")]
+apoedata[which(!is.na(apoedata$ApoE_comment)), "Proteotype"] = NA
+#apoedata[which(!is.na(apoedata$ApoE_comment)), c("LBREFID", "Proteotype", "ApoE_comment")]
+
+```
+
+## Read in tau data
+
+```{r}
+
+files = file.info(list.files(folder, pattern = "All pTau Data", full.names = T))
+latesfile.tau = rownames(files[which.max(files$mtime),])
+
+message(paste0("Latest file for p-tau is: ", latesfile.tau))
+
+```
+
+```{r}
+# Read tau file and force column types
+#  Cast p-tau and np-tau as numbers to force NA introduction where the lab puts "N/A"
+taudata = read_xlsx(latesfile.tau, 
+                      col_types = c("text", "numeric", "numeric", "text", "text", "numeric", "text", "numeric", "date", "text"))
+
+taudata$converteddate = sapply(taudata$`Date of collection`, getDateFromExcel)
+taudata$converteddate = as.Date(taudata$converteddate)
+
+colnames(taudata) = c("LBREFID", "np_tau217", "p_tau217", "ptau_comment", "LBDTC_excel", "YOB", "USUBJID_s", "ptau_batch", "ptau_rundate", "TauAssayVersion", "LBDTC")
+```
+
+### Clean the comments
+
+```{r}
+formattable(table(taudata$ptau_comment))
+```
+
+```{r}
+
+# Convert "" to NA
+taudata$ptau_comment[which(taudata$ptau_comment == "")] = NA
+
+formattable(table(taudata$ptau_comment))
+
+paste0("Number of samples with comments: ", sum(as.numeric(!is.na(taudata$ptau_comment))))
+
+```
+
+If there are comments - we need to remove the data!
+
+```{r}
+
+#taudata[which(!is.na(taudata$ptau_comment)), c("LBREFID", "np_tau217", "p_tau217", "ptau_comment")]
+taudata[which(!is.na(taudata$ptau_comment)), "np_tau217"] = NA
+taudata[which(!is.na(taudata$ptau_comment)), "p_tau217"] = NA
+#taudata[which(!is.na(taudata$ptau_comment)), c("LBREFID", "np_tau217", "p_tau217", "ptau_comment")]
+
+```
+
+
+### Sort out the p-tau data by assay version
+
+```{r}
+taudata$np_tau217_V1 = ifelse(taudata$TauAssayVersion == "V1", taudata$np_tau217, NA)
+taudata$p_tau217_V1  = ifelse(taudata$TauAssayVersion == "V1", taudata$p_tau217, NA)
+
+taudata$np_tau217_V2 = ifelse(taudata$TauAssayVersion == "V2", taudata$np_tau217, NA)
+taudata$p_tau217_V2  = ifelse(taudata$TauAssayVersion == "V2", taudata$p_tau217, NA)
+```
+
+
+Samples where np_tau217_V1 is set by assay version
+
+```{r}
+table(!is.na(taudata$np_tau217_V1), taudata$TauAssayVersion)
+```
+
+Samples where np_tau217_V2 is set by assay version
+
+```{r}
+table(!is.na(taudata$np_tau217_V2), taudata$TauAssayVersion)
+```
+
+
+
+## Merge data
+
+### Merge the Abeta and ApoE data
+
+Abeta file and ApoE file unique IDs. These numbers have to match since we need Abeta data to assign SubectID and Collection date for the ApoE data.
+
+**If these numbers do not match the script will exit!**
+
+```{r}
+
+paste0("Abeta data unique sample IDs:", length(unique(abetadata$LBREFID)))
+paste0("ApoE data unique sample IDs:", length(unique(apoedata$LBREFID)))
+
+```
+
+```{r}
+
+if (length(unique(abetadata$LBREFID)) != length(abetadata$LBREFID)) {
+  
+  print(paste0("The number of unique LBREFIDs (", length(unique(abetadata$LBREFID)), ") is not the same as the number of data points (", length(abetadata$LBREFID), ")"))
+#  print(paste0("Before we merge the data we must take out any duplicate genotype data"))
+#  apoedata = apoedata[!duplicated(apoedata), ]
+  print("The following batches contain duplicated LBREFIDs: ")
+
+  print(unique(abetadata[duplicated(abetadata$LBREFID), c("LBREFID", "LBDTC", "Abeta_batch")]))
+  print(unique(abetadata[duplicated(abetadata$LBREFID, fromLast = T), c("LBREFID", "LBDTC", "Abeta_batch")]))
+  
+  knitr::knit_exit()
+  
+} else {
+  
+  print("No duplicate LBREFIDs in Abeta file")
+  
+}
+
+
+
+```
+
+```{r}
+
+entries = length(abetadata$LBREFID)
+
+studydata.abetaapoe = merge(abetadata, apoedata)
+
+if (entries != length(studydata.abetaapoe$LBREFID)) {
+  print("Merge of data failed!")
+  
+  print(paste0("Samples in Abeta not in ApoE: ", setdiff(abetadata$LBREFID, apoedata$LBREFID)))
+  print(paste0("Samples in ApoE not in Abeta: ", setdiff(apoedata$LBREFID, abetadata$LBREFID)))
+
+  knitr::knit_exit()
+  
+} else {
+  print("Merge successful!")
+  
+}
+
+#studydata.abetaapoe
+
+```
+
+### Merge in the p-tau data
+
+Tau data:
+
+```{r}
+colnames(taudata)
+```
+
+Apoe and Abeta data:
+
+```{r}
+colnames(studydata.abetaapoe)
+```
+
+Want to merge on: "LBREFID", "LBDTC", "USUBJID_s", "YOB".
+
+Want to remove "LBDTC_excel" from both frames before merging since there can be differences in how excel will treat the dates and that can cause merge issues.
+
+```{r}
+
+studydata.abetaapoeptau = merge(studydata.abetaapoe[,!(names(studydata.abetaapoe) %in% c("LBDTC_excel"))], 
+                                   taudata[,!(names(taudata) %in% c("LBDTC_excel"))], 
+                                   by = c("LBREFID", "LBDTC", "USUBJID_s", "YOB"),
+                                   all = T)
+
+
+
+```
+
+If there is duplication of LBREFID in this merged data frame - it means that the merge on "LBREFID", "LBDTC", "USUBJID_s", "YOB" resulted in duplication - and this must have come from differences in "LBDTC", "USUBJID_s", "YOB".
+
+```{r}
+
+if (length(unique(taudata$LBREFID)) != length(taudata$LBREFID)) {
+  print("LBREFIDs in tau data set are not unique")
+  knitr::knit_exit()  
+} else if (length(unique(studydata.abetaapoe$LBREFID)) != length(studydata.abetaapoe$LBREFID)) {
+  print("LBREFIDs in Abeta + apoE data set are not unique")
+  knitr::knit_exit()  
+} else if (length(unique(studydata.abetaapoeptau$LBREFID)) != length(studydata.abetaapoeptau$LBREFID)) {
+  print("LBREFIDs in tau + Abeta + apoE data set are not unique")
+  
+  duplicated = studydata.abetaapoeptau[duplicated(studydata.abetaapoeptau$LBREFID), "LBREFID"]
+  
+  print(studydata.abetaapoeptau[studydata.abetaapoeptau$LBREFID %in% duplicated, ])
+  
+  knitr::knit_exit()  
+} else {
+  
+  print("All LBREFIDs are unique")
+}
+
+
+```
+
+## Load the age data from Portal
+
+```{r}
+
+online = T
+
+
+if (online == F) {
+  # use downloaded file to load the data
+ studydata.portal = read.csv("agedata/Study_Participant_Age_20220112.csv", header = T)
+  
+} else {
+  # collect the file from the server
+  
+  token = "*redacted*"
+
+  # Base URL for server
+  baseurl = "*redacted"
+  
+  # Setup the header for authentication
+  h = httr::add_headers(Authorization= paste0("Token ", token))
+  
+  # The topic code/directory for the files
+  topic_code = "transfer-outbound"
+  
+  # Generate the URL for directory listing
+  u = paste0(baseurl, "/public/api/v1/docs/topics/", topic_code, "/files/") 
+  
+  # Request the directory listing
+  out <- httr::GET(u, config = h)
+  
+  # Parse the file list
+  filelist <- httr::content(out, as = 'parsed')
+  
+  if (filelist$meta == 200) {
+    # We got a response 
+    
+    # NOT ordering by date anymore
+    # Pick the last file
+    #dates = data.frame("entry" = integer(), "date" = character())
+    
+    print(" ---------------------------------- ")
+    print("Directory listing: ")
+    
+    for (i in seq (1, length(filelist$data))) {
+      
+      # NOT ordering by date anymore
+      # 2022-02-09T03:07:46.431732Z
+      #datestring = filelist$data[i][[1]]$ts_last_modify
+      #date = as.Date(filelist$data[i][[1]]$ts_last_modify)
+      #dates = rbind(dates, data.frame("entry" = i, "date" = date))
+      
+      #print(paste0("Date: ", date))
+      
+      print(paste0(" - ", filelist$data[i][[1]]$label, ", Date: ", filelist$data[i][[1]]$ts_last_modify))
+      
+      if (filelist$data[i][[1]]$label == "Study Participant Age Listing") {
+        latestfile = i
+      }
+      
+    }
+    
+    # NOT ordering by date anymore
+    #latestfile = dates[order(dates$date, decreasing = T), "entry"][1]
+    
+    # Get the download URL
+    downloadurl  = filelist$data[latestfile][[1]]$latest_version$download_url
+    u = paste0(baseurl, downloadurl)
+    
+    #out <- httr::GET(u, config = h)
+    vector_header = c('Authorization'= paste('Token', token))
+    h = httr::add_headers(.headers=vector_header)
+    studydata.portal <- read.csv(url(u, headers = vector_header))
+    
+    #save the file for future use
+    filename = paste0("agedata/", filelist$data[latestfile][[1]]$label, "_", filelist$data[latestfile][[1]]$ts_file_last_modify, ".csv")
+    # The given ts_last_modify
+    filename = paste0("agedata/", filelist$data[latestfile][[1]]$label, "_", filelist$data[latestfile][[1]]$ts_file_last_modify, ".csv")
+    filename = gsub(':', '_', filename)
+    write.csv(studydata.portal, filename)
+    
+    print(" ---------------------------------- ")
+    print(paste0("Downloaded file: ", filelist$data[latestfile][[1]]$label, ""))
+    print(paste0("Downloaded URL: ", u, ""))
+    print(paste0("Description : ", filelist$data[latestfile][[1]]$description, ""))
+    print(paste0("Date updated : ", filelist$data[latestfile][[1]]$ts_file_last_modify, ""))
+    print(" ---------------------------------- ")
+
+  } else {
+    paste0(filelist)
+    knitr::knit_exit()
+    
+  }  
+
+}
+
+colnames(studydata.portal) = c("USUBJID","LBREFID", "age")
+
+paste0("Number of participants in the file: ", length(unique(studydata.portal$LBREFID)))
+
+```
+
+Merge the data
+
+```{r}
+studydata = merge(studydata.abetaapoeptau, studydata.portal, by = c("LBREFID"),  all.x = T)
+```
+
+### Copy over the subject IDs for direct from site samples
+
+USUBJID_s - comes from lab file
+
+USUBJID - comes from sponsor file
+
+It is possible that samples have this information from both file. We need to check and make sure that if that happens the two should match!
+
+Samples with a subject ID from both files:
+
+```{r}
+doublesubjectids = studydata[which(!is.na(studydata$USUBJID) & !is.na(studydata$USUBJID_s)), c("LBREFID", "USUBJID_s", "USUBJID", "LBDTC", "YOB", "age", "Abeta_batch")]
+
+
+if (length(doublesubjectids$LBREFID) == 0) {
+  print("There are no samples with subject ID from both files")
+
+} else {
+  
+  mismatches = studydata[which(!is.na(studydata$USUBJID) & !is.na(studydata$USUBJID_s) & studydata$USUBJID_s != studydata$USUBJID), c("LBREFID", "USUBJID_s", "USUBJID", "LBDTC", "YOB", "age", "Abeta_batch")]
+  
+  if (length(mismatches$LBREFID) > 0) {
+    print("Some samples with USUBJID from both file have NON-matching USUBJID.")
+    print(mismatches)
+    knitr::knit_exit()
+    
+  } else {
+    print("All samples with USUBJID from both file have matching USUBJID.")
+    #print(paged_table(doublesubjectids))
+    
+  }
+  
+}
+
+```
+
+Copy USUBJID_s to USUBJID. We have already done a check to make sure that if a patient
+
+```{r}
+# copy the USUBJID_s to USUBJID
+studydata[which(!is.na(studydata$USUBJID_s)), ]$USUBJID = studydata[which(!is.na(studydata$USUBJID_s)), ]$USUBJID_s
+```
+
+After combining the USUBJID and USUBJID_s into one variable (USUBJID), do we have any samples with empty USUBJID:
+
+```{r}
+table(is.na(studydata$USUBJID))
+```
+
+
+These are samples where the LBREFID does not resolve to a USUBJID in any of the files we compare to.
+
+```{r}
+studydata[which(is.na(studydata$USUBJID)), ]
+```
+
+Samples with missing USUBJID will not be reported, since data is assembled by USUBJID.
+
+### Set visit
+
+Visit is set based on presence of USUBJID_s. Default is "1", but samples direct from site who have a USUBJID_s are "1a".
+
+```{r}
+
+# Default is 1
+studydata$VISIT = "1"
+
+# Direct from site
+studydata[which(!is.na(studydata$USUBJID_s)), ]$VISIT = "1a"
+
+table(studydata$VISIT)
+
+
+# now we do not need USUBJID_s anymore - drop USUBJID_s
+studydata = studydata[,!(names(studydata) %in% c("USUBJID_s"))]
+
+
+```
+
+## Calculate age
+
+For samples with collection date and year of birth -\> calculate their age.
+
+Number of samples with no age data:
+
+```{r}
+
+length(studydata[which(is.na(studydata$age)), "LBREFID"])
+
+```
+
+Calculate age for direct from site samples and copy to the age variable.
+
+```{r}
+
+# Get year of collection and year of birth
+studydata$calcage = as.numeric(format(studydata$LBDTC, "%Y")) - as.numeric(studydata$YOB)
+
+# copy the calculated age in to the age variable
+studydata[which(!is.na(studydata$calcage)), ]$age = studydata[which(!is.na(studydata$calcage)), ]$calcage
+
+#paged_table(studydata[which(!is.na(studydata$calcage)), c("LBREFID", "age", "calcage", "Abeta_batch")])
+
+```
+
+Number of samples with no age data:
+
+```{r}
+
+length(studydata[which(is.na(studydata$age)), "LBREFID"])
+
+paged_table(studydata[which(is.na(studydata$age)), ])
+
+# drop YOB and calcage
+studydata = studydata[,!(names(studydata) %in% c("calcage", "YOB"))]
+
+```
+
+#### Age check
+
+```{r}
+
+ggplot(studydata, aes(x=age)) + 
+  geom_histogram(aes(y=..density..),fill="dodgerblue3",color="white",alpha=0.7, binwidth = 1) + 
+  geom_density() +
+#  geom_rug() +
+  labs(x='Abeta4240_Plasma_IPMS') +
+  annotate("text", x=mean(studydata$age), y=0.02, label = paste0("mean = ", round(mean(studydata$age), 3))) +
+  theme_minimal()
+
+
+if (sum(as.numeric(studydata$age < 45), na.rm = T) > 0) {
+  
+  print("Some ages are too low!")
+  knitr::knit_exit()
+  
+} else {
+  
+  print("All ages are above or equal to 45")
+  
+}
+
+min(studydata$age, na.rm = T)
+
+```
+
+# Data Checks - All Data
+
+Columns present in the wide file:
+
+```{r}
+colnames(studydata)
+
+paged_table(studydata)
+```
+
+```{r}
+paste0("Number of entries in wide data set: ", length(studydata$LBREFID))
+
+paste0("Number of entries in wide data set - Abeta: ", length(na.omit(studydata$Abeta40_Plasma_IPMS)))
+paste0("Number of entries in wide data set - ApoE: ", length(na.omit(studydata$Proteotype)))
+paste0("Number of entries in wide data set - p-tau: ", length(na.omit(studydata$p_tau217)))
+paste0("Number of entries in wide data set - age: ", length(na.omit(studydata$age)))
+
+paste0("Number of entries in wide data set - LBDTC: ", length(na.omit(studydata$LBDTC)))
+paste0("Number of entries in wide data set - USUBJID: ", length(na.omit(studydata$USUBJID)))
+
+```
+
+# Data review
+
+Note: Review is done prior to calculating the APS and APS2 and removing duplicate samples. This is for all raw data processed from the lab.
+
+
+## Abeta
+
+### Averages tracking by batch
+
+```{r}
+ggplot(studydata, aes(x=Abeta_batch, y=Abeta4240_Plasma_IPMS)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,0.250)) +
+  geom_hline(yintercept = mean(na.omit(studydata$Abeta4240_Plasma_IPMS)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Batch") +
+  theme_minimal()
+
+```
+
+
+```{r}
+ggplot(studydata, aes(x=Abeta_batch, y=Abeta40_Plasma_IPMS)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, 1500)) +
+  geom_hline(yintercept = mean(na.omit(studydata$Abeta40_Plasma_IPMS)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Batch") +
+  theme_minimal()
+
+ggplot(studydata, aes(x=Abeta_batch, y=Abeta42_Plasma_IPMS)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, 150)) +
+  geom_hline(yintercept = mean(na.omit(studydata$Abeta42_Plasma_IPMS)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Batch") +
+  theme_minimal()
+
+```
+
+### Averages tracking by date
+
+```{r}
+
+ggplot(studydata, aes(x=Abeta_rundate, y=Abeta4240_Plasma_IPMS)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,0.250)) +
+  geom_hline(yintercept = mean(na.omit(studydata$Abeta4240_Plasma_IPMS)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+```{r}
+ggplot(studydata, aes(x=Abeta_rundate, y=Abeta40_Plasma_IPMS)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, 1500)) +
+  geom_hline(yintercept = mean(na.omit(studydata$Abeta40_Plasma_IPMS)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal()
+
+ggplot(studydata, aes(x=Abeta_rundate, y=Abeta42_Plasma_IPMS)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, 150)) +
+  geom_hline(yintercept = mean(na.omit(studydata$Abeta42_Plasma_IPMS)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal()
+
+```
+
+## p-tau217 V1
+
+
+### Averages tracking by batch
+
+```{r}
+ggplot(studydata, aes(x=ptau_batch, y=p_tau217_V1/np_tau217_V1*100)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, 20)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V1/studydata$np_tau217_V1*100)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Batch") +
+  theme_minimal()
+
+ggplot(studydata, aes(x=ptau_batch, y=p_tau217_V1)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, ULOQ_pTau217_v1+10)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V1)), color = "firebrick", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = LLOQ_pTau217_v1, color = "red") +
+  geom_hline(yintercept = ULOQ_pTau217_v1, color = "red") +
+  labs(x = "Batch") +
+  theme_minimal()
+```
+
+
+```{r}
+ggplot(studydata, aes(x=ptau_batch, y=np_tau217_V1)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,400)) +
+  geom_hline(yintercept = mean(na.omit(studydata$np_tau217_V1)), color = "firebrick", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = LLOQ_npTau217_v1, color = "red") +
+  geom_hline(yintercept = ULOQ_npTau217_v1, color = "red") +
+  labs(x = "Batch") +
+  theme_minimal()
+
+```
+
+### Averages tracking by date
+
+```{r}
+ggplot(studydata, aes(x=ptau_rundate, y=p_tau217_V1/np_tau217_V1*100)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,20)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V1/studydata$np_tau217_V1*100)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(studydata, aes(x=ptau_rundate, y=p_tau217_V1)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,20)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V1)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal()
+```
+
+
+```{r}
+ggplot(studydata, aes(x=ptau_rundate, y=np_tau217_V1)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,400)) +
+  geom_hline(yintercept = mean(na.omit(studydata$np_tau217_V1)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal()
+
+```
+
+
+
+
+## p-tau217 V2
+
+
+### Averages tracking by batch
+
+```{r}
+ggplot(studydata, aes(x=ptau_batch, y=p_tau217_V2/np_tau217_V2*100)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, 60)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V2/studydata$np_tau217_V2*100)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Batch") +
+  theme_minimal()
+
+ggplot(studydata, aes(x=ptau_batch, y=p_tau217_V2)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0, ULOQ_pTau217_v2+2)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V2)), color = "firebrick", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = LLOQ_pTau217_v2, color = "red") +
+  geom_hline(yintercept = ULOQ_pTau217_v2, color = "red") +
+  labs(x = "Batch") +
+  theme_minimal()
+```
+
+
+```{r}
+ggplot(studydata, aes(x=ptau_batch, y=np_tau217_V2)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,400)) +
+  geom_hline(yintercept = mean(na.omit(studydata$np_tau217_V2)), color = "firebrick", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = LLOQ_npTau217_v2, color = "red") +
+  geom_hline(yintercept = ULOQ_npTau217_v2, color = "red") +
+  labs(x = "Batch") +
+  theme_minimal()
+
+```
+
+### Averages tracking by date
+
+```{r}
+ggplot(studydata, aes(x=ptau_rundate, y=p_tau217_V2/np_tau217_V2*100)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,20)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V2/studydata$np_tau217_V2*100)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(studydata, aes(x=ptau_rundate, y=p_tau217_V2)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,20)) +
+  geom_hline(yintercept = mean(na.omit(studydata$p_tau217_V2)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal()
+```
+
+
+```{r}
+ggplot(studydata, aes(x=ptau_rundate, y=np_tau217_V2)) + 
+  geom_point(alpha = 0.1) +
+#  geom_smooth(method = loess) +
+  coord_cartesian(ylim = c(0,400)) +
+  geom_hline(yintercept = mean(na.omit(studydata$np_tau217_V2)), color = "firebrick", linetype = "dashed", size = 1) +
+  labs(x = "Date") +
+  theme_minimal()
+
+```
+
+
+
+
+
+# Assemble the data into Long Format
+
+Data is reported on a per USUBJID basis:
+
+1)  Generate list of unique USUBJIDs (but do not allow NA as a USUBJID)
+2)  Iterate through the list of USUBJIDs and assemble data for each of the analytes based on data in the wide table
+3)  If there is more than one entry in wide table for a USUBJID - pick the earliest sample where we have a result
+
+```{r}
+subjectids = unique(na.omit(studydata$USUBJID))
+
+paste0("Number of unique subjectIDs in the file: ", length(subjectids))
+
+```
+
+
+```{r}
+
+missingusubjids = studydata[which(is.na(studydata$USUBJID)), c("LBREFID", "LBDTC", "Abeta4240_Plasma_IPMS", "Abeta_batch", "Proteotype", "ptau_batch")]
+
+if (length(missingusubjids$LBREFID) > 0) {
+  cat("**Samples with a missing USUBJID:**")  
+  
+  print(formattable(studydata[which(is.na(studydata$USUBJID)), c("LBREFID", "LBDTC", "Abeta4240_Plasma_IPMS", "Abeta_batch", "Proteotype", "ptau_batch")]))  
+  
+  warning("**Some samples have a missing USUBJID**")
+  
+} else {
+  cat("**All samples have a USUBJID**")  
+
+}
+ 
+```
+
+
+## DTA Specified Analyses
+
+![](images/table-01.png)
+
+
+Data to assemble:
+
+-   AB42
+
+-   AB40
+
+-   AB4240
+
+-   APOE
+
+-   APOE_POSNEG
+
+-   P_TAU217
+
+-   NPTAU217, formerly NP_TAU217
+
+-   PTAU_RTO, formerly P_TAU217_RATIO
+
+-   APS(\*)
+
+-   APS2(\*)
+
+(\*) APS and APS2 are calculated values and will be calculated from final long data.
+
+```{r}
+PrecivityAD = readRDS("model.clia3_25.rds")
+PrecivityAD2 = readRDS("model_precivityAD2VR_FINAL_20221220.rds")
+PrecivityAD2_v2 = readRDS("model_PrecivityAD2_COMBINED_20230703.rds")
+```
+
+Dynamic Fields:
+
+| Field Name | Value   |
+|------------|---------|
+| USUBJID    | dynamic |
+| LBREFID    | dynamic |
+| VISIT      | dynamic |
+| LBDTC      | dynamic |
+| LBTESTCD   | dynamic |
+| LBORRES    | dynamic |
+| LBSTAT     | dynamic |
+| LBREASND   | dynamic |
+| LBMETHOD   | "LC-MS/MS" or "LC-MS/MS_v2" |
+
+Version 2p5 - LBMETHOD is now assay version specific.
+
+## Iterate through the unique USUBJIDs
+
+```{r}
+subjectid = ""
+```
+
+
+```{r}
+# Assemble data function
+# Takes as argument a subject ID - finds all the data for that subject ID and assemble it into a long format data frame
+# - this one is big dont mess unless you know what you are doing :)
+
+assembledata = function (subjectid) {
+
+  patientdata = NULL
+
+  dataforsubject = studydata[which(studydata$USUBJID == subjectid), ]
+  
+  # --------
+  # get the Abeta data
+  # - is there an entry with data?  
+  abetaentry = dataforsubject[!is.na(dataforsubject$Abeta4240_Plasma_IPMS), ]
+  
+  if (length(abetaentry$LBREFID) == 1) {
+    # Do nothing - we have what we need  
+  
+  } else {
+    # Sort through what we have
+    
+    if(length(abetaentry$LBREFID) > 1) {
+      # pick lowest batch number
+      abetaentry = abetaentry[which(abetaentry$Abeta_batch == min(abetaentry$Abeta_batch)), ]
+    } else if (length(abetaentry$LBREFID) == 0) {
+      # There were no non-empty entries - pick the sample with Abeta comment and highest Abeta_batch
+      abetaentry = dataforsubject[which(!is.na(dataforsubject$Abeta_comment) & dataforsubject$Abeta_batch == max(dataforsubject$Abeta_batch)), ]
+      
+      # There can be samples with no Abeta data run yet
+      if (length(abetaentry$LBREFID) == 0) {
+        # set all fields to NA
+        abetaentry = dataforsubject[1, ]
+        abetaentry[] = NA
+      }
+    }
+    
+    if(length(abetaentry$LBREFID) > 1) {
+      print("Non unique Abeta data even after rules applied")
+      
+      print(abetaentry)
+      
+      knitr::knit_exit()
+    }
+    
+  }
+  
+  patientdata = data.frame("LBREFID" = abetaentry$LBREFID,
+                    "LBDTC" = as.Date(abetaentry$LBDTC),
+                    "LBTESTCD" = c("AB40", "AB42", "AB4240"),
+                    "VISIT" = abetaentry$VISIT,
+                    "LBORRES" = c(abetaentry$Abeta40_Plasma_IPMS, abetaentry$Abeta42_Plasma_IPMS, round(abetaentry$Abeta4240_Plasma_IPMS, 3)),
+                    "LBSTAT" = ifelse(abetaentry$Abeta_comment != "", "ND", ""),
+                    "LBREASND" = abetaentry$Abeta_comment,
+                    "LBMETHOD" = "LC-MS/MS"
+                    )
+  
+  # --------
+  # get the ApoE data
+  if (!is.na(abetaentry$Proteotype)) {
+    # 1) does the abetaentry have ApoE data? If so pick it!
+    apoeentry = abetaentry
+
+  } else {
+    # 2) go find that apoe data else where
+    # - is there an entry with data?  
+    apoeentry = dataforsubject[!is.na(dataforsubject$Proteotype), ]
+    
+    if(length(apoeentry$LBREFID) > 1) {
+      # pick lowest batch number
+      apoeentry = apoeentry[which(apoeentry$Abeta_batch == min(apoeentry$Abeta_batch)), ]
+      
+    } else if (length(apoeentry$LBREFID) == 0) {
+      # There were no non-empty entries - pick the sample with ApoE_comment and highest Abeta_batch
+      apoeentry = dataforsubject[which(!is.na(dataforsubject$ApoE_comment) & dataforsubject$Abeta_batch == max(dataforsubject$Abeta_batch)), ]
+      
+      # There can be samples with no ApoE data run yet
+      if (length(apoeentry$LBREFID) == 0) {
+        # set all fields to NA
+        apoeentry = dataforsubject[1, ]
+        apoeentry[] = NA
+      }
+    }
+    
+  }
+  
+  if(length(apoeentry$LBREFID) > 1) {
+    print("Non unique ApoE data even after rules applied")
+    
+    print(apoeentry)
+
+    knitr::knit_exit()
+  }
+
+  apoe = data.frame("LBREFID" = apoeentry$LBREFID,
+                    "LBDTC" = (as.Date(apoeentry$LBDTC)),
+                    "LBTESTCD" = c("APOE", "APOE_POSNEG"),
+                    "VISIT" = apoeentry$VISIT,
+                    "LBORRES" = c(gsub('/', '_', apoeentry$Proteotype), apoeentry$APOE_POSNEG),
+                    "LBSTAT" = ifelse(apoeentry$ApoE_comment != "", "ND", ""),
+                    "LBREASND" = apoeentry$ApoE_comment,
+                    "LBMETHOD" = "LC-MS/MS"
+                    )
+
+  patientdata = rbind(patientdata, apoe)
+
+  
+  # Calculate APS needs
+  #  - age, apoe4copynr, apoe2present, Abeta4240_Plasma_IPMS
+  age = abetaentry$age
+  apoe4copynr = count_e4_alleles(apoeentry$Proteotype)
+  apoe2present = is_e2_present(apoeentry$Proteotype)
+  Abeta4240_Plasma_IPMS = abetaentry$Abeta4240_Plasma_IPMS
+  
+  reasonnotdone = NA
+  if (is.na(Abeta4240_Plasma_IPMS)) {
+    reasonnotdone = "Abeta data missing"
+  } else if (is.na(age)) {
+    reasonnotdone = "Patient age missing"
+  } else if (is.na(apoe4copynr)) {
+    reasonnotdone = "ApoE data missing"
+  }
+  
+  if (is.na(reasonnotdone)) {
+    # Calculate APS
+    APS = round(predict(PrecivityAD, newdata = data.frame("Abeta4240_Plasma_IPMS" = Abeta4240_Plasma_IPMS, "age" = age, "apoe4copynr" = apoe4copynr, "apoe2present" = apoe2present), type='response') * 100)
+    
+    aps = data.frame("LBREFID" = abetaentry$LBREFID,
+                     "LBDTC" = as.Date(abetaentry$LBDTC),
+                     "LBTESTCD" = "APS",
+                     "VISIT" = abetaentry$VISIT,
+                     "LBORRES" = APS,
+                     "LBSTAT" = NA,
+                     "LBREASND" = NA,
+                     "LBMETHOD" = "LC-MS/MS"
+    )
+    
+  } else {
+    aps = data.frame("LBREFID" = abetaentry$LBREFID,
+                     "LBDTC" = as.Date(abetaentry$LBDTC),
+                     "LBTESTCD" = "APS",
+                     "VISIT" = abetaentry$VISIT,
+                     "LBORRES" = NA,
+                     "LBSTAT" = "ND",
+                     "LBREASND" = reasonnotdone,
+                     "LBMETHOD" = "LC-MS/MS"
+    )
+    
+  }
+  
+  patientdata = rbind(patientdata, aps)
+  
+
+  # --------
+  # get the p-tau data
+  # - is there an entry with data?  
+  tauentry = dataforsubject[!is.na(dataforsubject$p_tau217), ]
+
+  if(length(tauentry$LBREFID) == 1) {
+    # Do nothing - we have what we need  
+    
+  } else {
+
+    if(length(tauentry$LBREFID) > 1) {
+      # pick lowest batch number
+      tauentry = tauentry[which(tauentry$ptau_batch == min(tauentry$ptau_batch)), ]
+      
+    } else if (length(tauentry$LBREFID) == 0) {
+      # There were no non-empty entries - pick the sample with ptau_comment comment and highest ptau_batch
+      tauentry = dataforsubject[which(!is.na(dataforsubject$ptau_comment) & dataforsubject$ptau_batch == max(dataforsubject$ptau_batch)), ]
+      
+      # There can be samples with no tau data run yet
+      if (length(tauentry$LBREFID) == 0) {
+        # set all fields to NA
+        tauentry = dataforsubject[1, ]
+        tauentry[] = NA
+        tauentry$ptau_comment = "No sample received for this analysis"
+        
+      }
+    }
+    
+    if(length(tauentry$LBREFID) > 1) {
+      print("Non unique p-tau data even after rules applied")
+      knitr::knit_exit()
+    }
+    
+  }
+  
+  
+  aps2.reasonnotdone = NA
+  #ptauratioformodels =  tauentry$p_tau217 / tauentry$np_tau217 * 100
+
+  
+  # LIMIT OF QUANTITATION CHECKS IMPLEMENTED!!!
+  if (!is.na(tauentry$TauAssayVersion) & tauentry$TauAssayVersion == "V2") {
+    method = "LC-MS/MS_v2"
+    
+    LLOQ_pTau217  = LLOQ_pTau217_v2
+    LLOQ_npTau217 = LLOQ_npTau217_v2
+    ULOQ_pTau217  = ULOQ_pTau217_v2
+    ULOQ_npTau217 = ULOQ_npTau217_v2
+  } else {
+    method = "LC-MS/MS"
+    
+    LLOQ_pTau217  = LLOQ_pTau217_v1
+    LLOQ_npTau217 = LLOQ_npTau217_v1
+    ULOQ_pTau217  = ULOQ_pTau217_v1
+    ULOQ_npTau217 = ULOQ_npTau217_v1
+  }
+  
+  
+  ptauratioforreporting = tauentry$p_tau217 / tauentry$np_tau217 * 100
+  
+  # First set the default - then we can modify if there is a BLQ ALQ issue
+  ptau = data.frame("LBREFID" = tauentry$LBREFID,
+                    "LBDTC" = as.Date(tauentry$LBDTC),
+                    "LBTESTCD" = c("P_TAU217", "NPTAU217", "PTAU_RTO"),
+                    "VISIT" = tauentry$VISIT,
+                    "LBORRES" = c(tauentry$p_tau217, tauentry$np_tau217, ptauratioforreporting),
+                    "LBSTAT" = ifelse(tauentry$ptau_comment != "", "ND", ""),
+                    "LBREASND" = tauentry$ptau_comment,
+                    "LBMETHOD" = method
+                    )
+
+  # LOQ tests for samples with data and no comments
+  if (is.na(tauentry$ptau_comment) & !is.na(tauentry$p_tau217) & !is.na(tauentry$np_tau217)) {
+
+    if (tauentry$np_tau217 < LLOQ_npTau217) {
+      tauentry$np_tau217 =  NA
+      
+      # Set status
+      ptau[which(ptau$LBTESTCD == "NPTAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBSTAT = "ND"
+      
+      # Take out result and ratio
+      ptau[which(ptau$LBTESTCD == "NPTAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBORRES = NA
+      
+      # Set reason not done
+      ptau[which(ptau$LBTESTCD == "NPTAU217"), ]$LBREASND = "BLQ"
+      ptau[which(ptau$LBTESTCD == "PTAU_RTO"), ]$LBREASND = "Cannot calculate ratio"
+
+    } else if (tauentry$np_tau217 > ULOQ_npTau217) {
+      tauentry$np_tau217 =  NA
+      
+      # Set status
+      ptau[which(ptau$LBTESTCD == "NPTAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBSTAT = "ND"
+      
+      # Take out result and ratio
+      ptau[which(ptau$LBTESTCD == "NPTAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBORRES = NA
+
+      # Set reason not done
+      ptau[which(ptau$LBTESTCD == "NPTAU217"), ]$LBREASND = "ALQ"
+      ptau[which(ptau$LBTESTCD == "PTAU_RTO"), ]$LBREASND = "Cannot calculate ratio"
+      
+    }
+    
+    if (tauentry$p_tau217 < LLOQ_pTau217) {
+      tauentry$p_tau217 = 0.5*LLOQ_pTau217
+      
+      # Set status
+      ptau[which(ptau$LBTESTCD == "P_TAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBSTAT = "ND"
+      
+      # Take out result and ratio
+      ptau[which(ptau$LBTESTCD == "P_TAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBORRES = NA
+      
+      # Set reason not done
+      ptau[which(ptau$LBTESTCD == "P_TAU217"), ]$LBREASND = "BLQ"
+      ptau[which(ptau$LBTESTCD == "PTAU_RTO"), ]$LBREASND = "Cannot calculate ratio"
+
+    } else if (tauentry$p_tau217 > ULOQ_pTau217) {
+      tauentry$p_tau217 = NA
+      
+      # Set status
+      ptau[which(ptau$LBTESTCD == "P_TAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBSTAT = "ND"
+      
+      # Take out result and ratio
+      ptau[which(ptau$LBTESTCD == "P_TAU217" | ptau$LBTESTCD == "PTAU_RTO"), ]$LBORRES = NA
+      
+      # Set reason not done
+      ptau[which(ptau$LBTESTCD == "P_TAU217"), ]$LBREASND = "ALQ"
+      ptau[which(ptau$LBTESTCD == "PTAU_RTO"), ]$LBREASND = "Cannot calculate ratio"
+      
+    } 
+
+  }
+
+  # Ratio for models is the ratio used in the APS2 model
+  # Ratio for reporting is the reported ratio - we do not report ratios on _ANY_ ALQ/BLQ samples!!!
+  
+  patientdata = rbind(patientdata, ptau)
+  
+
+  # Calculate APS2 needs
+  #  - Abeta4240_Ratio, p.tau217.ratio
+  p.tau217.ratio  = tauentry$p_tau217 / tauentry$np_tau217 * 100
+  Abeta4240_Ratio = abetaentry$Abeta4240_Plasma_IPMS
+  
+  if (is.na(Abeta4240_Ratio)) {
+    aps2.reasonnotdone = "Abeta data missing"
+  } else if (is.na(p.tau217.ratio)) {
+    aps2.reasonnotdone = "p-tau data missing"
+  } 
+  
+  if (is.na(aps2.reasonnotdone)) {
+    # Calculate APS
+    
+    if (!is.na(tauentry$TauAssayVersion) & tauentry$TauAssayVersion == "V2") {
+      APS2 = round(predict(PrecivityAD2_v2, newdata = data.frame("p_tau217_ratio" = p.tau217.ratio, "Abeta_4240" = Abeta4240_Ratio), type='response') * 100)
+    } else {
+      APS2 = round(predict(PrecivityAD2, newdata = data.frame("p.tau217.ratio" = p.tau217.ratio, "Abeta4240_Ratio" = Abeta4240_Ratio), type='response') * 100)
+    }
+    
+    
+    aps2 = data.frame("LBREFID" = tauentry$LBREFID,
+                     "LBDTC" = as.Date(tauentry$LBDTC),
+                     "LBTESTCD" = "APS2",
+                     "VISIT" = tauentry$VISIT,
+                     "LBORRES" = APS2,
+                     "LBSTAT" = NA,
+                     "LBREASND" = NA,
+                     "LBMETHOD" = method
+    )
+    
+  } else {
+    aps2 = data.frame("LBREFID" = tauentry$LBREFID,
+                     "LBDTC" = as.Date(tauentry$LBDTC),
+                     "LBTESTCD" = "APS2",
+                     "VISIT" = tauentry$VISIT,
+                     "LBORRES" = NA,
+                     "LBSTAT" = "ND",
+                     "LBREASND" = aps2.reasonnotdone,
+                     "LBMETHOD" = method
+    )
+    
+  }
+  
+  patientdata = rbind(patientdata, aps2)
+  
+  # Set subjectID
+  patientdata$USUBJID = subjectid
+  
+  return(patientdata)
+  
+}
+```
+
+
+
+
+
+
+```{r Do not panic - even as parallel this can take a long time}
+
+subjectids = unique(na.omit(studydata$USUBJID))
+
+# Just test first 1,000 subject ids
+#subjectids = subjectids[1:1000]
+
+now2 <<- Sys.time()
+
+message(paste0("Checkpoint Start: ", difftime(Sys.time(), now2)))
+
+
+#studydata
+
+# Set to traditional to make it easier to debug
+traditional = F
+
+if (traditional) {
+  # Iterate over USUBJIDS one by one
+  combineddata = NULL
+  for(subjectid in subjectids) {
+    combineddata = rbind(combineddata, assembledata(subjectid))
+  }  
+  message(paste0("Checkpoint Serial Stop: ", difftime(Sys.time(), now2)))
+  
+} else {
+  # Run this as parallel
+  cluster = makeCluster(detectCores())
+
+  if (Sys.info()["sysname"] == "Darwin") {
+    # Mac
+    registerDoParallel(cluster)
+    combineddata = foreach(x = 1:length(subjectids), .combine='rbind') %dopar% assembledata(subjectids[x])
+    stopImplicitCluster()
+  } else {
+    # PC/Windows
+    registerDoSNOW(cluster)
+    combineddata = foreach(x = 1:length(subjectids), .combine='rbind') %dopar% assembledata(subjectids[x])
+    stopCluster(cluster)
+  }
+  
+  message(paste0("Checkpoint foreach-dopar Stop: ", difftime(Sys.time(), now2)))
+
+}
+
+
+# Foreach run
+#combineddata.foreach = foreach(x = 1:length(subjectids), .combine='rbind') %do% assembledata(subjectids[x])
+#message(paste0("Checkpoint foreach-do Stop: ", difftime(Sys.time(), now2)))
+
+
+
+```
+
+
+V1 vs V2 distribution:
+
+```{r}
+table(combineddata[which(combineddata$LBTESTCD == "APS2"), "LBMETHOD"])
+```
+
+
+We now have the data in long format and no-longer have the need to sort data by dates so to ensure smooth csv export we will convert dates to text before exporting.
+
+```{r}
+# 1.3) Convert date to text
+combineddata$LBDTC = as.character(combineddata$LBDTC)
+
+```
+
+
+
+### Prepare data for Portal
+
+Static Fields:
+
+| Field Name | Value       |
+|------------|-------------|
+| STUDYID    | "STUDY"     |
+| DOMAIN     | "LB"        |
+| SITE       | ""          |
+| LBNAM      | "LAB"       |
+| LBSPEC     | "PLASMA"    |
+| LBCAT      | "BIOMARKER" |
+| LBORRESU   | per above   |
+
+```{r}
+combineddata$STUDYID  = "STUDY"
+combineddata$DOMAIN   = "LB"
+combineddata$SITE     = ""
+combineddata$LBNAM    = "LAB" 
+combineddata$LBSPEC   = "PLASMA"  
+combineddata$LBCAT    = "BIOMARKER"
+#combineddata$LBMETHOD = "LC-MS/MS"
+
+# UNIT DEPENDS ON LBTESTCD
+combineddata$LBORRESU = "" 
+combineddata$LBORRESU[which(combineddata$LBTESTCD == "AB42" | 
+                              combineddata$LBTESTCD == "AB40" | 
+                              combineddata$LBTESTCD == "P_TAU217" | 
+                              combineddata$LBTESTCD == "NPTAU217")] = "pg/mL"
+
+# ORDER THE COLUMNS
+col_order = c("STUDYID", "DOMAIN", "SITE", "USUBJID", "LBNAM", "LBREFID", "VISIT", "LBDTC", "LBSPEC", "LBCAT", "LBTESTCD", "LBORRES", "LBORRESU", "LBMETHOD", "LBSTAT", "LBREASND")
+studydata.export.long.sort = combineddata[, col_order]
+
+# SORT BY USUBJID, LBTESTCD
+studydata.export.long.sort = studydata.export.long.sort[
+  with(studydata.export.long.sort, order(USUBJID, LBTESTCD)),
+]
+
+# REPLACE ALL NA WITH "".
+studydata.export.long.sort[is.na(studydata.export.long.sort)] = ""
+
+# REPLACE THE "_2" AT THE END OF THE RESCREEN SAMPLES WITH ""
+studydata.export.long.sort$LBREFID = gsub("_2$", "", studydata.export.long.sort$LBREFID)
+```
+
+
+Perform QC on data:
+
+1)  If LBSTAT = ND, then LBORRES must be empty (status not done - so should have no results)
+
+2)  If LBORRES is empty and LBSTAT is empty, then LBREFID must also be empty (no result and no status - it must be a sample that has not been analyzed yet so there should be no barcode, if there is a barcode there should either be a result or a status ND)
+
+```{r}
+
+if (length(studydata.export.long.sort[which((studydata.export.long.sort$LBSTAT == "ND") & 
+                                               (studydata.export.long.sort$LBORRES != "")), ]$LBSTAT) > 0) {
+
+  print("Some data has LBSTAT = ND but also a LBORRES")
+  
+  print(studydata.export.long.sort[which((studydata.export.long.sort$LBSTAT == "ND") & 
+                                              (studydata.export.long.sort$LBORRES != "")), ])
+
+  filename = paste0("Study uploads/Study_PROD_FULL_", currentDate, "_ERROR.csv")
+  write.csv(studydata.export.long.sort, filename, row.names=FALSE)
+
+  knitr::knit_exit()
+
+} 
+
+if (length(studydata.export.long.sort[which((studydata.export.long.sort$LBSTAT == "") & 
+                                               (studydata.export.long.sort$LBORRES == "") &
+                                               (studydata.export.long.sort$LBREFID != "")), ]$LBSTAT) > 0) {
+  
+  print("Some data has LBSTAT and LBORRES empty - but has a LBREFID")
+  
+  print(studydata.export.long.sort[which((studydata.export.long.sort$LBSTAT == "") & 
+                                              (studydata.export.long.sort$LBORRES == "") &
+                                              (studydata.export.long.sort$LBREFID != "")), ])
+  
+  filename = paste0("Study uploads/Study_PROD_FULL_", currentDate, "_ERROR.csv")
+  write.csv(studydata.export.long.sort, filename, row.names=FALSE)
+  
+  knitr::knit_exit()
+
+} else {
+  print("Pass")
+  
+}
+
+
+```
+
+
+```{r}
+
+#Paged table will only print 10,000 records. This file is up to 66k lines - no need to print...
+#paged_table(studydata.export.long.sort, options = list(rownames.print = F))
+
+```
+
+### Prepare data for IRT/Oracle
+
+```{r}
+
+studydata.ApoE = studydata.export.long.sort[which(studydata.export.long.sort$LBTESTCD == "APOE_POSNEG"), ]
+
+# They do not want any ND samples in their data set
+studydata.ApoE = studydata.ApoE[which(!is.na(studydata.ApoE$LBORRES) & studydata.ApoE$LBORRES != ""), ]
+
+# They do not want any empty USUBJID in their data set
+studydata.ApoE = studydata.ApoE[which(!is.na(studydata.ApoE$USUBJID)), ]
+
+
+```
+
+They want sitecode which can be parsed from the subjectID as values 4 to 6 in the USUBJID
+
+```{r}
+# They want sitecode which can be parsed from the subjectID
+studydata.ApoE$SITE = substr(studydata.ApoE$USUBJID, 4, 6)
+
+table(studydata.ApoE$SITE)
+
+print("20 random samples of SITE extracted from USUBJID")
+studydata.ApoE[sample(which(!is.na(studydata.ApoE$SITE)), 20), c("USUBJID", "SITE")]
+
+```
+
+```{r}
+#Paged table will only print 10,000 records. This file is up to 7k lines - no need to print...
+#paged_table(studydata.ApoE)
+```
+
+
+# Data Checks - Per Patient Data
+
+Collapse data back to per patient data.
+
+```{r}
+studydata.wide = reshape(studydata.export.long.sort[, c("USUBJID", "LBTESTCD", "LBORRES")], idvar = "USUBJID", timevar = "LBTESTCD", direction = "wide")
+```
+
+
+```{r}
+
+paste0("Samples with ApoE data but no Abeta data: ", length(studydata.wide[which(studydata.wide$LBORRES.APOE != "" & studydata.wide$LBORRES.AB4240 == ""), "USUBJID"]))
+paste0("Samples with ApoE data but no tau data: ", length(studydata.wide[which(studydata.wide$LBORRES.APOE != "" & studydata.wide$LBORRES.PTAU_RTO == ""), "USUBJID"]))
+
+
+paste0("Samples with Abeta data but no ApoE data: ", length(studydata.wide[which(studydata.wide$LBORRES.APOE == "" & studydata.wide$LBORRES.AB4240 != ""), "USUBJID"]))
+paste0("Samples with Abeta data but no tau data: ", length(studydata.wide[which(studydata.wide$LBORRES.PTAU_RTO == "" & studydata.wide$LBORRES.AB4240 != ""), "USUBJID"]))
+
+paste0("Samples with tau data but no Abeta data: ", length(studydata.wide[which(studydata.wide$LBORRES.PTAU_RTO != "" & studydata.wide$LBORRES.AB4240 == ""), "USUBJID"]))
+paste0("Samples with tau data but no ApoE data: ", length(studydata.wide[which(studydata.wide$LBORRES.PTAU_RTO != "" & studydata.wide$LBORRES.APOE == ""), "USUBJID"]))
+
+
+```
+
+
+
+
+```{r}
+ggplot(studydata.wide, aes(x=as.numeric(LBORRES.AB4240), y=as.numeric(LBORRES.PTAU_RTO))) +
+  geom_point(alpha = 0.05, size = 2.5) +
+  coord_cartesian(ylim = c(0,40), xlim = c(0.06,0.16)) +
+  geom_vline(xintercept = 0.089, color = 'dodgerblue', linetype="longdash") +
+  geom_vline(xintercept = 0.1, color = 'firebrick2', linetype="longdash") +
+  geom_hline(yintercept = 2.38, color = 'dodgerblue', linetype="longdash") +
+  geom_hline(yintercept = 1.5, color = 'firebrick2', linetype="longdash") +
+  labs(title = "A/T217 Plot", x = "Abeta ratio", y = "p-tau217 ratio")
+```
+
+```{r}
+studydata.wide.rundate = merge(studydata.wide, studydata[, c("USUBJID", "ptau_rundate")], by = "USUBJID")
+
+studydata.wide.rundate = studydata.wide.rundate[which(!is.na(studydata.wide.rundate$ptau_rundate)), ]
+
+studydata.wide.rundate.v1 = studydata.wide.rundate[which(studydata.wide.rundate$ptau_rundate < as.Date("2023-08-12")), ]
+studydata.wide.rundate.v2 = studydata.wide.rundate[which(studydata.wide.rundate$ptau_rundate > as.Date("2023-08-12")), ]
+```
+
+
+V1:
+
+```{r}
+ggplot(studydata.wide.rundate.v1, aes(x=as.numeric(LBORRES.AB4240), y=as.numeric(LBORRES.PTAU_RTO), color = ptau_rundate)) +
+  geom_point(alpha = 0.2, size = 2.5) +
+  coord_cartesian(xlim = c(0.06,0.15)) +
+  geom_vline(xintercept = 0.089, color = 'dodgerblue', linetype="longdash") +
+  geom_vline(xintercept = 0.1, color = 'firebrick2', linetype="longdash") +
+  geom_hline(yintercept = 2.38, color = 'dodgerblue', linetype="longdash") +
+  geom_hline(yintercept = 1.5, color = 'firebrick2', linetype="longdash") +
+  labs(title = "A/T217 Plot", x = "Abeta ratio", y = "p-tau217 ratio")
+
+```
+
+V2:
+
+```{r}
+ggplot(studydata.wide.rundate.v2, aes(x=as.numeric(LBORRES.AB4240), y=as.numeric(LBORRES.PTAU_RTO), color = ptau_rundate)) +
+  geom_point(alpha = 0.2, size = 2.5) +
+  coord_cartesian(xlim = c(0.06,0.15)) +
+  geom_vline(xintercept = 0.089, color = 'dodgerblue', linetype="longdash") +
+  geom_vline(xintercept = 0.1, color = 'firebrick2', linetype="longdash") +
+  geom_hline(yintercept = 2.38, color = 'dodgerblue', linetype="longdash") +
+  geom_hline(yintercept = 1.5, color = 'firebrick2', linetype="longdash") +
+  labs(title = "A/T217 Plot", x = "Abeta ratio", y = "p-tau217 ratio")
+
+```
+
+
+
+V1 data: 
+
+```{r fig.height=20, fig.width=20}
+ggplot(studydata.wide.rundate.v1, aes(x=as.numeric(LBORRES.AB4240), y=as.numeric(LBORRES.PTAU_RTO))) +
+  geom_point(alpha = 0.2, size = 2.5) +
+  facet_wrap(~ ptau_rundate) +
+  coord_cartesian(ylim = c(0,10), xlim = c(0.06,0.15)) +
+  geom_vline(xintercept = 0.089, color = 'dodgerblue', linetype="longdash") +
+  geom_vline(xintercept = 0.1, color = 'firebrick2', linetype="longdash") +
+  geom_hline(yintercept = 2.38, color = 'dodgerblue', linetype="longdash") +
+  geom_hline(yintercept = 1.5, color = 'firebrick2', linetype="longdash") +
+  labs(title = "A/T217 Plot", x = "Abeta ratio", y = "p-tau217 ratio")
+
+```
+
+V2 data:
+
+```{r fig.height=20, fig.width=20}
+ggplot(studydata.wide.rundate.v2, aes(x=as.numeric(LBORRES.AB4240), y=as.numeric(LBORRES.PTAU_RTO))) +
+  geom_point(alpha = 0.2, size = 2.5) +
+  facet_wrap(~ ptau_rundate) +
+  coord_cartesian(ylim = c(0,30), xlim = c(0.06,0.15)) +
+  geom_vline(xintercept = 0.089, color = 'dodgerblue', linetype="longdash") +
+  geom_vline(xintercept = 0.1, color = 'firebrick2', linetype="longdash") +
+  geom_hline(yintercept = 4.2, color = 'dodgerblue', linetype="longdash") +
+  labs(title = "A/T217 Plot", x = "Abeta ratio", y = "p-tau217 ratio")
+
+```
+
+
+
+# Compare data
+
+Here we will load in the latest data file that has been uploaded and check our new assembled data against the last transfers.
+
+## IRT File
+
+```{r}
+
+columnsforcomparison = c("USUBJID", "LBREFID", "VISIT", "LBDTC", "LBORRES")
+
+files = file.info(list.files("IRT uploads", pattern = "LAB_prod_", full.names = T))
+latesfile.IRT = rownames(files[which.max(files$mtime),])
+
+latestIRT = read.csv(latesfile.IRT, colClasses = "character")
+
+paste0("Latest file for IRT is: ", latesfile.IRT)
+paste0(" - File contains ", length(latestIRT$STUDYID), " entries (", length(studydata.ApoE$STUDYID), " entries in current dataset)")
+
+
+
+```
+
+USUBJID in current run, but not in previous file:
+
+```{r}
+
+newsubjids = setdiff(studydata.ApoE$USUBJID, latestIRT$USUBJID)
+paged_table(studydata.ApoE[which(studydata.ApoE$USUBJID %in% newsubjids), columnsforcomparison], options = list(rownames.print = F))
+
+```
+
+USUBJID in previous file but not in the current run:
+
+```{r}
+
+oldsubjids = setdiff(latestIRT$USUBJID, studydata.ApoE$USUBJID)
+paged_table(latestIRT[which(latestIRT$USUBJID %in% oldsubjids), columnsforcomparison], options = list(rownames.print = F))
+
+```
+
+
+Other changes not related to USUBJID:
+
+```{r}
+
+latestIRT.noUSUBJIDdelta = latestIRT[which(!(latestIRT$USUBJID %in% c(oldsubjids, newsubjids))), columnsforcomparison]
+studydata.ApoE.noUSUBJIDdelta = studydata.ApoE[which(!(studydata.ApoE$USUBJID %in% c(oldsubjids, newsubjids))), columnsforcomparison]
+
+print("Existing file")
+paged_table(setdiff(latestIRT.noUSUBJIDdelta, studydata.ApoE.noUSUBJIDdelta), options = list(rownames.print = F))
+
+
+print("New file")
+paged_table(setdiff(studydata.ApoE.noUSUBJIDdelta, latestIRT.noUSUBJIDdelta), options = list(rownames.print = F))
+
+```
+
+
+## Sponsor File
+
+```{r}
+
+columnsforcomparison = c("USUBJID", "LBREFID", "VISIT", "LBDTC", "LBTESTCD", "LBORRES")
+
+files = file.info(list.files("Study uploads", pattern = "Study_PROD_FULL", full.names = T))
+latestfile.study = rownames(files[which.max(files$mtime),])
+
+latestfile = read.csv(latestfile.study, colClasses = "character")
+
+paste0("Latest file for study is: ", latestfile.study)
+paste0(" - File contains ", length(latestfile$STUDYID), " entries (", length(studydata.export.long.sort$STUDYID), " entries in current dataset)")
+
+
+
+```
+
+USUBJID in current run, but not in previous file:
+
+```{r}
+
+newsubjids = setdiff(studydata.export.long.sort$USUBJID, latestfile$USUBJID)
+paged_table(studydata.export.long.sort[which(studydata.export.long.sort$USUBJID %in% newsubjids), columnsforcomparison], options = list(rownames.print = F))
+
+```
+
+USUBJID in previous file but not in the current run:
+
+```{r}
+
+oldsubjids = setdiff(latestfile$USUBJID, studydata.export.long.sort$USUBJID)
+paged_table(latestfile[which(latestfile$USUBJID %in% oldsubjids), columnsforcomparison], options = list(rownames.print = F))
+
+```
+
+
+Other changes not related to USUBJID:
+
+```{r}
+
+latestfile.noUSUBJIDdelta = latestfile[which(!(latestfile$USUBJID %in% c(oldsubjids, newsubjids))), columnsforcomparison]
+studydata.export.long.sort.noUSUBJIDdelta = studydata.export.long.sort[which(!(studydata.export.long.sort$USUBJID %in% c(oldsubjids, newsubjids))), columnsforcomparison]
+
+print("Existing file")
+paged_table(setdiff(latestfile.noUSUBJIDdelta, studydata.export.long.sort.noUSUBJIDdelta), options = list(rownames.print = F))
+
+
+print("New file")
+paged_table(setdiff(studydata.export.long.sort.noUSUBJIDdelta, latestfile.noUSUBJIDdelta), options = list(rownames.print = F))
+
+```
+
+
+
+
+
+
+# Save data
+
+```{r}
+
+currentTime = format(Sys.time(), "%H%M%S")
+
+```
+
+## Save data for Oracle
+
+```{r}
+
+ApoE_Filename = paste0("IRT uploads/LAB_prod_", currentDate, currentTime, ".csv")
+write.csv(studydata.ApoE, ApoE_Filename, row.names=FALSE)
+
+paste0("ORACLE data saved to: ", ApoE_Filename)
+
+```
+
+Oracle data is uploaded to webcrf by sFTP
+
+For issues contact:
+
+Oracle Support toll-free number: (877) 859-2991
+
+## Save data for sponsor
+
+
+
+```{r}
+## TEST
+# Study_TEST_FULL_YYYYMMDDX.csv f
+
+## PROD
+# Study_PROD_FULL_YYYYMMDDX.csv 
+
+filename = paste0("Study uploads/Study_PROD_FULL_", currentDate, "1.csv")
+write.csv(studydata.export.long.sort, filename, row.names=FALSE)
+
+paste0("Study data export saved to: ", filename)
+```
+
+Study data is uploaded to the Study web portal.
+
+
+# End
+
+```{r}
+paste0("Time to run this code: ", difftime(Sys.time(), now))
+```
+
+
+```{r message=FALSE}
+
+
+message(paste0("Oracle data export saved to: ", ApoE_Filename))
+message(paste0("Study data export saved to: ", filename))
+message(paste0("Time to run this code: ", difftime(Sys.time(), now)))
+
+```
